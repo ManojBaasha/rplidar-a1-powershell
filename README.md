@@ -65,7 +65,7 @@ Get-RplidarInfo -Port COM3                               # read-only: model, fir
 |---|---|
 | `RPLidar.psm1` | The driver: capture, decoder, sweep selection, audit, CSV export, device info |
 | `scan.ps1` | One sweep (or `-Fuse`d sweep) to CSV |
-| `accuracy.ps1` | Tape-measure test: measured vs expected distance and angle, logged to `dataccuracy_log.csv` |
+| `accuracy.ps1` | Tape-measure test: measured vs expected distance and angle, logged to `data\accuracy_log.csv` |
 | `make_view.ps1` | CSV to a self-contained HTML top-down view |
 | `audit.ps1` | Integrity and repeatability report with PASS/FAIL checks |
 | `tests.ps1` | 1,470 hardware-free checks: decoder, CSV writer, fusion, nearest-object finder |
@@ -146,7 +146,7 @@ Conclusion: the capture path is lossless. Missing dots are the sensor reporting 
 
 ## Accuracy measurements
 
-None recorded yet. `accuracy.ps1` appends every real run to `dataccuracy_log.csv`; results are summarised here once taken.
+None recorded yet. `accuracy.ps1` appends every real run to `data\accuracy_log.csv`; results are summarised here once taken.
 
 ## License
 
