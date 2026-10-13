@@ -12,9 +12,10 @@ Built on a slow laptop (2-core i3, 8 GB), so the code is deliberately light.
 |---|---|
 | 1. Identify the device, install the driver, talk to it | done |
 | 2. Capture + decode + CSV + top-down view | done, validated (see below) |
+| 2b. Fuse revolutions (`scan.ps1 -Fuse`) | done, tested |
 | 3. Live view (continuous redraw) | planned |
 | 4. Mapping / SLAM (move the sensor, build a floor plan) | planned |
-| Accuracy test against a tape measure | **todo** (needed before trusting absolute distances) |
+| Accuracy test against a tape measure (`accuracy.ps1`) | tooling done, **measurements pending** (needed before trusting absolute distances) |
 
 ## Hardware
 
@@ -53,6 +54,8 @@ $cap   = Invoke-RplidarCapture -Port COM3 -Seconds 4     # motor on, record raw 
 $dec   = ConvertFrom-RplidarScan -Bytes $cap.Bytes       # .Revolutions (arrays of nodes) and .Stats
 $sweep = Select-RplidarSweep -Revolutions $dec.Revolutions
 Export-RplidarCsv -Nodes $sweep.Nodes -Path scan.csv
+Merge-RplidarRevolutions -Revolutions $dec.Revolutions    # fuse a still scene
+Find-RplidarNearestObject -Revolutions $dec.Revolutions   # nearest object per revolution
 Get-RplidarInfo -Port COM3                               # read-only: model, firmware, serial, health
 ```
 
@@ -61,10 +64,11 @@ Get-RplidarInfo -Port COM3                               # read-only: model, fir
 | File | Purpose |
 |---|---|
 | `RPLidar.psm1` | The driver: capture, decoder, sweep selection, audit, CSV export, device info |
-| `scan.ps1` | One sweep to CSV |
+| `scan.ps1` | One sweep (or `-Fuse`d sweep) to CSV |
+| `accuracy.ps1` | Tape-measure test: measured vs expected distance and angle, logged to `dataccuracy_log.csv` |
 | `make_view.ps1` | CSV to a self-contained HTML top-down view |
 | `audit.ps1` | Integrity and repeatability report with PASS/FAIL checks |
-| `tests.ps1` | 1,458 hardware-free checks of the decoder and CSV writer |
+| `tests.ps1` | 1,470 hardware-free checks: decoder, CSV writer, fusion, nearest-object finder |
 
 ## How it works
 
@@ -86,7 +90,7 @@ PowerShell and overflows the serial buffer.
 
 ## Validation
 
-Hardware-free (`tests.ps1`, 1,458 checks): exact round trip of angle, distance and quality for every node of
+Hardware-free (`tests.ps1`, 1,470 checks): exact round trip of angle, distance and quality for every node of
 synthetic revolutions (including values above 1000 mm and zero-distance nodes), partial-revolution handling,
 junk before the descriptor, junk injected mid-stream (exactly the injected bytes are reported skipped, no real node
 lost), angle limits (359.984 accepted, 360 rejected), CSV correctness under a comma-decimal locale (de-DE).
@@ -136,10 +140,13 @@ Conclusion: the capture path is lossless. Missing dots are the sensor reporting 
 
 ## Roadmap
 
-1. Tape-measure accuracy test (known distance straight ahead, and known angle).
-2. Fuse several revolutions into one denser sweep (median per angle bin).
-3. Live view with a light redraw loop.
-4. Scan matching / mapping while moving the sensor.
+1. Record the tape-measure results below (distance at several ranges, angle direction) and the pass band used.
+2. Live view with a light redraw loop.
+3. Scan matching / mapping while moving the sensor.
+
+## Accuracy measurements
+
+None recorded yet. `accuracy.ps1` appends every real run to `dataccuracy_log.csv`; results are summarised here once taken.
 
 ## License
 

@@ -97,5 +97,54 @@ $dense = $r.Revolutions[0]
 $pick = Select-RplidarSweep -Revolutions @($sparse, $dense)
 Assert-Equal $pick.Index 1 'selects densest revolution'
 
+# 8. Fusion: 8 noisy revolutions of one still scene with ~28% random dropouts -> fused sweep tracks the truth
+$rnd = New-Object System.Random 42
+function Get-Truth([double]$a) { 2500 + 400 * [math]::Sin($a * [math]::PI / 90) }
+$noisy = @(foreach ($k in 0..7) {
+    , @(for ($a = $rnd.NextDouble() * 1.4; $a -lt 360; $a += 1.38) {
+        $ok = $rnd.NextDouble() -gt 0.28
+        $d = if ($ok) { (Get-Truth $a) + ($rnd.NextDouble() - 0.5) * 20 } else { 0 }
+        [pscustomobject]@{ Angle = $a; Distance = $d; Quality = 15; Valid = $ok }
+    })
+})
+$stray = [pscustomobject]@{ Angle = 10.5; Distance = 500; Quality = 15; Valid = $true }   # one stray echo in one revolution only
+$noisy[0] = @($noisy[0]) + $stray
+$fused = @(Merge-RplidarRevolutions -Revolutions $noisy -BinDeg 1 -MinSupport 3)
+$worst = 0.0
+foreach ($f in $fused) { $e = [math]::Abs($f.Distance - (Get-Truth $f.Angle)); if ($e -gt $worst) { $worst = $e } }
+$singleValid = @($noisy[1] | Where-Object { $_.Valid }).Count
+Assert-Equal ($worst -le 40) $true "fused distance within 40 mm of truth (worst $([math]::Round($worst,1)) mm)"
+Assert-Equal ($fused.Count -gt 250) $true "fused sweep covers >250 bins (got $($fused.Count))"
+Assert-Equal ($fused.Count -gt $singleValid) $true "fused sweep denser than a single revolution ($($fused.Count) vs $singleValid)"
+Assert-Equal (@($fused | Where-Object { $_.Distance -lt 1000 }).Count) 0 'single stray echo rejected by MinSupport'
+Assert-Equal (@($fused | Where-Object { $_.Support -lt 3 }).Count) 0 'every fused bin has support >= 3'
+
+# 9. Nearest object: wall at 3000 mm, object at 1000 mm around 100 deg, one stray echo at 500 mm
+function New-WallRev([scriptblock]$objectAt, [double]$objDist, [double]$strayAngle) {
+    , @(for ($a = 0.0; $a -lt 360; $a += 1.4) {
+        $inObj = & $objectAt $a
+        $d = if ($inObj) { $objDist } else { 3000 }
+        if ([math]::Abs($a - $strayAngle) -lt 0.7) { $d = 500 }
+        [pscustomobject]@{ Angle = $a; Distance = $d; Quality = 15; Valid = $true }
+    })
+}
+$rev9 = New-WallRev { param($a) $a -ge 96.5 -and $a -le 103.5 } 1000 250
+$o = @(Find-RplidarNearestObject -Revolutions @(, $rev9))
+Assert-Equal $o.Count 1 'object found in revolution'
+Assert-Near $o[0].AngleDeg 100 1.5 'object angle'
+Assert-Near $o[0].DistanceMm 1000 0.001 'object distance (stray 500 mm echo ignored)'
+Assert-Equal ($o[0].Points -ge 4) $true 'object has several points'
+
+# object straddling 0 degrees (356..4): circular mean must come out near 0/360, not 180
+$rev9b = New-WallRev { param($a) $a -ge 357 -or $a -le 3 } 800 -1000
+$o2 = @(Find-RplidarNearestObject -Revolutions @(, $rev9b))
+$diff = [math]::Abs((($o2[0].AngleDeg - 0 + 540) % 360) - 180)
+Assert-Equal ($diff -le 1.5) $true "object across 0 deg: angle $([math]::Round($o2[0].AngleDeg,2)) is within 1.5 deg of 0"
+Assert-Near $o2[0].DistanceMm 800 0.001 'wrap-around object distance'
+
+# no valid points -> no object, no error
+$none = @(Find-RplidarNearestObject -Revolutions @(, @([pscustomobject]@{ Angle = 1; Distance = 0; Quality = 0; Valid = $false })))
+Assert-Equal $none.Count 0 'no object when nothing is valid'
+
 Write-Host ("{0} checks passed, {1} failed" -f $script:passed, $script:failed) -ForegroundColor $(if ($script:failed) { 'Red' } else { 'Green' })
 exit $(if ($script:failed) { 1 } else { 0 })

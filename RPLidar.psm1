@@ -4,6 +4,8 @@
 #   Invoke-RplidarCapture      hardware  : spin the motor, record raw bytes, always stop the motor
 #   ConvertFrom-RplidarScan    decoder   : raw bytes -> revolutions of nodes (pure function, no hardware)
 #   Select-RplidarSweep        selection : pick one representative revolution
+#   Merge-RplidarRevolutions   fusion    : median-merge many revolutions of a still scene into one denser sweep
+#   Find-RplidarNearestObject  measuring : nearest object per revolution (angle, distance) for accuracy tests
 #   Get-RplidarAudit           validation: integrity and repeatability statistics
 #   Export-RplidarCsv          output    : culture-independent CSV
 #
@@ -243,6 +245,108 @@ function Get-RplidarAudit {
     }
 }
 
+function Merge-RplidarRevolutions {
+    <#
+    .SYNOPSIS  Fuse several revolutions of a still scene into one denser, less noisy sweep.
+    .DESCRIPTION
+      Valid returns are grouped into BinDeg-wide angle bins. A bin is kept if at least MinSupport DIFFERENT
+      revolutions contributed to it (a single stray echo is discarded). The output node per bin has the median
+      distance and mean angle of its samples. Quality holds the support count (capped at 63); Support and
+      SpreadMm (max - min distance in the bin) are extra properties so noisy bins can be spotted.
+      Only valid for a still sensor and scene: moving objects smear across revolutions.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object[]]$Revolutions,
+        [ValidateRange(0.1, 10)][double]$BinDeg = 1,
+        [ValidateRange(1, 1000)][int]$MinSupport = 3
+    )
+    $angles = @{}; $dists = @{}; $lastRev = @{}; $support = @{}
+    for ($r = 0; $r -lt $Revolutions.Count; $r++) {
+        foreach ($n in $Revolutions[$r]) {
+            if (-not $n.Valid) { continue }
+            $b = [int][math]::Floor($n.Angle / $BinDeg)
+            if (-not $angles.ContainsKey($b)) {
+                $angles[$b] = New-Object 'System.Collections.Generic.List[double]'
+                $dists[$b] = New-Object 'System.Collections.Generic.List[double]'
+                $support[$b] = 0; $lastRev[$b] = -1
+            }
+            $angles[$b].Add($n.Angle); $dists[$b].Add($n.Distance)
+            if ($lastRev[$b] -ne $r) { $lastRev[$b] = $r; $support[$b]++ }
+        }
+    }
+    foreach ($b in ($angles.Keys | Sort-Object)) {
+        if ($support[$b] -lt $MinSupport) { continue }
+        $d = @($dists[$b] | Sort-Object)
+        $mid = [int][math]::Floor(($d.Count - 1) / 2)
+        $median = if ($d.Count % 2) { $d[$mid] } else { ($d[$mid] + $d[$mid + 1]) / 2 }
+        [pscustomobject]@{
+            Angle    = ($angles[$b] | Measure-Object -Average).Average
+            Distance = $median
+            Quality  = [math]::Min($support[$b], 63)
+            Valid    = $true
+            Support  = $support[$b]
+            SpreadMm = $d[-1] - $d[0]
+        }
+    }
+}
+
+function Find-RplidarNearestObject {
+    <#
+    .SYNOPSIS  In each revolution, find the nearest solid object (a cluster of neighbouring valid returns at a similar distance).
+    .DESCRIPTION
+      Candidates are tried nearest first. A cluster grows from the seed point to angular neighbours (circularly,
+      so an object straddling 0 degrees works) while consecutive points are at most MaxStepDeg apart and within
+      DepthToleranceMm of the seed distance. The first cluster with at least MinPoints points wins, so a lone
+      stray echo is ignored. Returns one row per revolution that contains such an object:
+      AngleDeg (circular mean, 0-360), DistanceMm (median), Points, WidthDeg.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object[]]$Revolutions,
+        [double]$MinRangeMm = 150,
+        [double]$DepthToleranceMm = 100,
+        [double]$MaxStepDeg = 3,
+        [int]$MinPoints = 3
+    )
+    for ($r = 0; $r -lt $Revolutions.Count; $r++) {
+        $v = @($Revolutions[$r] | Where-Object { $_.Valid -and $_.Distance -ge $MinRangeMm } | Sort-Object Angle)
+        $n = $v.Count
+        if ($n -lt $MinPoints) { continue }
+        $order = 0..($n - 1) | Sort-Object { $v[$_].Distance }
+        $found = $null
+        foreach ($seed in $order) {
+            $members = New-Object 'System.Collections.Generic.List[int]'
+            $members.Add($seed)
+            $j = $seed
+            while ($members.Count -lt $n) {          # grow towards increasing angle
+                $nx = ($j + 1) % $n
+                $step = ($v[$nx].Angle - $v[$j].Angle + 360) % 360
+                if ($nx -eq $seed -or $step -gt $MaxStepDeg -or [math]::Abs($v[$nx].Distance - $v[$seed].Distance) -gt $DepthToleranceMm) { break }
+                $members.Add($nx); $j = $nx
+            }
+            $j = $seed
+            while ($members.Count -lt $n) {          # grow towards decreasing angle
+                $pv = ($j - 1 + $n) % $n
+                $step = ($v[$j].Angle - $v[$pv].Angle + 360) % 360
+                if ($members.Contains($pv) -or $step -gt $MaxStepDeg -or [math]::Abs($v[$pv].Distance - $v[$seed].Distance) -gt $DepthToleranceMm) { break }
+                $members.Add($pv); $j = $pv
+            }
+            if ($members.Count -ge $MinPoints) { $found = $members; break }
+        }
+        if ($null -eq $found) { continue }
+        $sx = 0.0; $sy = 0.0; $dist = New-Object 'System.Collections.Generic.List[double]'
+        foreach ($m in $found) { $t = $v[$m].Angle * [math]::PI / 180; $sx += [math]::Sin($t); $sy += [math]::Cos($t); $dist.Add($v[$m].Distance) }
+        $ang = ([math]::Atan2($sx, $sy) * 180 / [math]::PI + 360) % 360
+        $ds = @($dist | Sort-Object)
+        $med = if ($ds.Count % 2) { $ds[[int][math]::Floor($ds.Count / 2)] } else { ($ds[$ds.Count / 2 - 1] + $ds[$ds.Count / 2]) / 2 }
+        $angs = @($found | ForEach-Object { $v[$_].Angle })
+        $rel = @($angs | ForEach-Object { (($_ - $ang + 540) % 360) - 180 })      # angles relative to the centroid, -180..180
+        $width = ($rel | Measure-Object -Maximum).Maximum - ($rel | Measure-Object -Minimum).Minimum
+        [pscustomobject]@{ Revolution = $r + 1; AngleDeg = $ang; DistanceMm = $med; Points = $found.Count; WidthDeg = $width }
+    }
+}
+
 function Export-RplidarCsv {
     <#
     .SYNOPSIS  Write nodes as CSV with '.' decimals and no thousands separators, whatever the Windows locale.
@@ -295,4 +399,4 @@ function Get-RplidarInfo {
     finally { $sp.Close() }
 }
 
-Export-ModuleMember -Function Invoke-RplidarCapture, ConvertFrom-RplidarScan, Select-RplidarSweep, Get-RplidarAudit, Export-RplidarCsv, Get-RplidarInfo
+Export-ModuleMember -Function Invoke-RplidarCapture, ConvertFrom-RplidarScan, Select-RplidarSweep, Merge-RplidarRevolutions, Find-RplidarNearestObject, Get-RplidarAudit, Export-RplidarCsv, Get-RplidarInfo
