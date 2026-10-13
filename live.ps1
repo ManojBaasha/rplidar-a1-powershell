@@ -39,7 +39,7 @@ button,select{background:#16202b;color:#9fb3c8;border:1px solid #2a3a4a;border-r
 <button id="pause">Pause</button> range <select id="range"><option value="0">auto</option><option>1</option><option>2</option><option>4</option><option>8</option><option>12</option></select> m</div>
 <script>
 const cv=document.getElementById('c'),x=cv.getContext('2d'),info=document.getElementById('info');
-let revs=[],since=-1,paused=false,autoR=2,meta={};
+let revs=[],since=-1,paused=false,autoR=2,meta={},lastData=performance.now();
 document.getElementById('pause').onclick=e=>{paused=!paused;e.target.textContent=paused?'Resume':'Pause';draw()};
 function draw(){
   const dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;
@@ -66,7 +66,8 @@ async function poll(){
   try{
     if(!paused){
       const r=await fetch('/scan?since='+since,{cache:'no-store'});
-      if(r.status===200){const j=await r.json();since=j.rev;meta=j;revs.push(j);if(revs.length>4)revs.shift();draw()}
+      if(r.status===200){const j=await r.json();since=j.rev;meta=j;lastData=performance.now();revs.push(j);if(revs.length>4)revs.shift();draw()}
+      else if(revs.length&&performance.now()-lastData>2000)info.textContent='NO NEW DATA for '+((performance.now()-lastData)/1000).toFixed(0)+' s. Check the sensor and its USB cable; the server restarts the scan if this continues.';
     }
   }catch(e){info.textContent='server not reachable (stopped?)'}
   setTimeout(poll,110);
@@ -82,6 +83,9 @@ $stamps = New-Object 'System.Collections.Generic.Queue[double]'   # completion t
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
 $lastRequest = [System.Diagnostics.Stopwatch]::StartNew()
 $decoder = New-RplidarStreamDecoder
+$bytesTotal = 0L; $restarts = 0; $restartsInRow = 0; $nextBeat = 10
+$lastByte = [System.Diagnostics.Stopwatch]::StartNew()      # time since bytes last arrived (watchdog)
+$stallSeconds = 3                                           # no bytes for this long = restart the scan
 
 function Publish([object]$nodes) {
     $script:latestRev++
@@ -138,15 +142,37 @@ try {
                     $n = [math]::Min($take - $k, $replay.Length - $p)
                     [Array]::Copy($replay, $p, $buf, $k, $n); $k += $n; $replayFed += $n
                 }
-                & $decoder.Feed $buf; $busy = $true
+                & $decoder.Feed $buf; $busy = $true; $bytesTotal += $take; $lastByte.Restart()
             }
         }
         else {
             $n = $sp.BytesToRead
-            if ($n -gt 0) { $n = $sp.Read($chunk, 0, [math]::Min($n, $chunk.Length)); $buf = New-Object byte[] $n; [Array]::Copy($chunk, $buf, $n); & $decoder.Feed $buf; $busy = $true }
+            if ($n -gt 0) {
+                $n = $sp.Read($chunk, 0, [math]::Min($n, $chunk.Length)); $buf = New-Object byte[] $n; [Array]::Copy($chunk, $buf, $n)
+                & $decoder.Feed $buf; $busy = $true; $bytesTotal += $n; $lastByte.Restart()
+            }
+            elseif ($lastByte.Elapsed.TotalSeconds -ge $stallSeconds) {
+                # Watchdog: the sensor stopped sending. Restart the scan (motor off/on, fresh decoder) a few times, then give up.
+                if ($restartsInRow -ge 3) { $stopReason = "sensor stopped sending data and 3 restarts did not help" }
+                else {
+                    $restarts++; $restartsInRow++
+                    Write-Host ('[{0:F0}s] no bytes for {1:F1} s (revolutions so far {2}, bytes {3}); restarting the scan, attempt {4}' -f $clock.Elapsed.TotalSeconds, $lastByte.Elapsed.TotalSeconds, $latestRev, $bytesTotal, $restartsInRow)
+                    try {
+                        Stop-RplidarScan -Port $sp
+                        $sp = Start-RplidarScan -Port $Port
+                        $decoder = New-RplidarStreamDecoder
+                    }
+                    catch { $stopReason = "could not restart the scan: $($_.Exception.Message)" }
+                    $lastByte.Restart(); $busy = $true
+                }
+            }
         }
         $done = & $decoder.Take
-        if ($done.Count -gt 0) { Publish $done[$done.Count - 1] }   # newest completed revolution; older ones are skipped if we fell behind
+        if ($done.Count -gt 0) { Publish $done[$done.Count - 1]; $restartsInRow = 0 }   # newest completed revolution; older ones are skipped if we fell behind
+        if ($clock.Elapsed.TotalSeconds -ge $nextBeat) {
+            $nextBeat += 10; $st = & $decoder.Stats
+            Write-Host ('[{0:F0}s] revolutions {1}, bytes {2}, skipped {3}, restarts {4}' -f $clock.Elapsed.TotalSeconds, $latestRev, $bytesTotal, $st.SkippedBytes, $restarts)
+        }
 
         # 2. HTTP
         if ($pending.IsCompleted) {
@@ -162,6 +188,11 @@ try {
                     $since = 0; [void][int]::TryParse($ctx.Request.QueryString['since'], [ref]$since)
                     if ($null -eq $latestJson -or $since -eq $latestRev) { Send $ctx 204 $null $null }
                     else { Send $ctx 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes($latestJson)) }
+                }
+                elseif ($path -eq '/status') {      # diagnostics
+                    $st = & $decoder.Stats
+                    $j = '{{"uptime":{0:F0},"revolutions":{1},"bytes":{2},"secondsSinceBytes":{3:F1},"skipped":{4},"nodes":{5},"restarts":{6}}}' -f $clock.Elapsed.TotalSeconds, $latestRev, $bytesTotal, $lastByte.Elapsed.TotalSeconds, $st.SkippedBytes, $st.Nodes, $restarts
+                    Send $ctx 200 'application/json' ([System.Text.Encoding]::UTF8.GetBytes($j))
                 }
                 else { Send $ctx 404 'text/plain' ([System.Text.Encoding]::ASCII.GetBytes('not found')) }
             }

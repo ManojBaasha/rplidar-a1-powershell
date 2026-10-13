@@ -122,6 +122,8 @@ bytes are chunked) and serves the newest revolution to a canvas page that redraw
 - The motor never runs forever: it stops after `-MaxMinutes` (default 10) and after `-IdleSeconds` (default 120)
   without a browser request. Ctrl+C also stops it. The port and motor are released in a `finally` block.
 - `-ReplayRaw data\raw.bin` plays a recording at real speed through the same pipeline, for testing without the motor.
+- **Watchdog:** if no bytes arrive for 3 s the server restarts the scan (up to 3 times in a row) and logs it; the page shows "NO NEW DATA" when updates stop. /status returns diagnostics (bytes, seconds since last bytes, skipped bytes, restarts).
+- **Known issue:** in one 70 s run the stream froze at about 15 s (the server kept answering but no new revolutions). The sensor streamed normally when restarted, so the cause is not yet known; the watchdog and the diagnostics were added to catch it. A later 70 s run on the sensor with the diagnostics on ran cleanly (steady 9.8 KB/s, 7.5 rev/s, 0 skipped bytes, 0 restarts), so the freeze has not been reproduced and its cause is unresolved.
 - Measured on the 2-core i3 laptop: about 5 % of one core on the real sensor (about 2 % in replay), 0 skipped bytes,
   7.5 revolutions/s.
 ## Known sensor behaviour (found the hard way)
