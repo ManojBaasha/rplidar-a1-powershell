@@ -32,7 +32,7 @@ $s = $a.Stats
 
 "== Integrity =="
 "bytes captured            : $($s.TotalBytes)"
-"nodes decoded             : $($s.Nodes)  (bytes = 7-byte header + 5 x nodes + $($s.SkippedBytes) skipped + $($s.LeftoverBytes) leftover)"
+"nodes decoded             : $($s.Nodes)  (bytes = $($s.PreDescriptorBytes) before header + 7-byte header + 5 x nodes + $($s.SkippedBytes) skipped + $($s.LeftoverBytes) leftover)"
 "bytes skipped (re-align)  : $($s.SkippedBytes)   <- 0 means no byte was lost or corrupted"
 "leftover bytes            : $($s.LeftoverBytes)   <- incomplete node at the very end (0-4 is normal)"
 "complete revolutions      : $($s.CompleteRevolutions)  (excluded: $($s.NodesBeforeFirstStart) nodes before the first start flag, $($s.NodesInPartialLastRev) in the unfinished last one)"

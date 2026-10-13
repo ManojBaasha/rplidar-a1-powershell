@@ -146,5 +146,51 @@ Assert-Near $o2[0].DistanceMm 800 0.001 'wrap-around object distance'
 $none = @(Find-RplidarNearestObject -Revolutions @(, @([pscustomobject]@{ Angle = 1; Distance = 0; Quality = 0; Valid = $false })))
 Assert-Equal $none.Count 0 'no object when nothing is valid'
 
+# 10. Streaming decoder: identical results however the bytes are chunked
+function Invoke-Chunked([byte[]]$bytes, [int[]]$sizes) {
+    $dec = New-RplidarStreamDecoder
+    $pos = 0; $k = 0
+    while ($pos -lt $bytes.Length) {
+        $n = [math]::Min($sizes[$k % $sizes.Count], $bytes.Length - $pos); $k++
+        $chunk = New-Object byte[] $n; [Array]::Copy($bytes, $pos, $chunk, 0, $n)
+        & $dec.Feed $chunk; $pos += $n
+    }
+    $revs = & $dec.Take
+    $second = & $dec.Take
+    [pscustomobject]@{ Revs = $revs; SecondTake = $second; Stats = (& $dec.Stats) }
+}
+function Get-Sig($revs) { (@($revs | ForEach-Object { ($_ | ForEach-Object { '{0},{1},{2},{3}' -f $_.Angle, $_.Distance, $_.Quality, $_.Valid }) -join ';' })) -join '|' }
+$refSig = Get-Sig $r.Revolutions
+$randSizes = [int[]](1..60 | ForEach-Object { 1 + $rnd.Next(40) })
+$chunkings = [ordered]@{ '1 byte' = @(1); '2 bytes' = @(2); '3 bytes' = @(3); '5 bytes' = @(5); '7 bytes' = @(7); '64 bytes' = @(64); 'irregular' = @(1,2,3,4,5,6,7,8,9,10,11,12,13); 'random' = $randSizes }
+foreach ($name in $chunkings.Keys) {
+    $c = Invoke-Chunked $stream $chunkings[$name]
+    Assert-Equal $c.Revs.Count 3 "stream [$name]: revolution count"
+    Assert-Equal (Get-Sig $c.Revs) $refSig "stream [$name]: identical to batch decode"
+    Assert-Equal $c.SecondTake.Count 0 "stream [$name]: second Take is empty"
+    Assert-Equal $c.Stats.SkippedBytes 0 "stream [$name]: nothing skipped"
+    Assert-Equal $c.Stats.Nodes $r.Stats.Nodes "stream [$name]: node count"
+    Assert-Equal $c.Stats.NodesInPartialLastRev 50 "stream [$name]: partial revolution"
+}
+# corruption and junk-before-descriptor survive chunking (descriptor split across chunks, junk dropped and counted)
+$corrupt = [byte[]]($descriptor + (ConvertTo-Bytes $revA) + $bCorrupt + (ConvertTo-Bytes $revC) + (ConvertTo-Bytes $partial))
+foreach ($sz in 1, 7, 33) {
+    $cc = Invoke-Chunked $corrupt @($sz)
+    Assert-Equal $cc.Stats.SkippedBytes 3 "stream corrupt [$sz-byte chunks]: exactly the 3 injected bytes skipped"
+    Assert-Equal $cc.Revs.Count 3 "stream corrupt [$sz-byte chunks]: revolutions"
+}
+$junked = [byte[]](@(0x11, 0x22, 0x33, 0xA5, 0x5A) + $stream)    # junk that even looks like the start of a descriptor
+$jj = Invoke-Chunked $junked @(1)
+Assert-Equal $jj.Revs.Count 3 'stream: junk before descriptor, 1-byte chunks'
+Assert-Equal $jj.Stats.PreDescriptorBytes 5 'stream: junk before descriptor is counted'
+# incremental Take: revolutions appear as soon as they complete
+$dec = New-RplidarStreamDecoder
+& $dec.Feed ([byte[]]($descriptor + (ConvertTo-Bytes $revA) + (ConvertTo-Bytes $revB)[0..4]))
+$t1 = & $dec.Take
+Assert-Equal $t1.Count 1 'incremental: revolution A completes when the first node of B (start flag) arrives'
+& $dec.Feed ([byte[]]((ConvertTo-Bytes $revB)[5..((ConvertTo-Bytes $revB).Length - 1)] + (ConvertTo-Bytes $revC)[0..4]))
+$t2 = & $dec.Take
+Assert-Equal $t2.Count 1 'incremental: revolution B completes when the first node of C arrives'
+
 Write-Host ("{0} checks passed, {1} failed" -f $script:passed, $script:failed) -ForegroundColor $(if ($script:failed) { 'Red' } else { 'Green' })
 exit $(if ($script:failed) { 1 } else { 0 })

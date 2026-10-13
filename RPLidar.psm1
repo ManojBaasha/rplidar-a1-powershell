@@ -1,8 +1,10 @@
 # RPLidar.psm1 - minimal driver for the Slamtec RPLidar A1 (standard SCAN mode) in plain PowerShell.
 #
 # Layers (each can be used and tested on its own):
-#   Invoke-RplidarCapture      hardware  : spin the motor, record raw bytes, always stop the motor
-#   ConvertFrom-RplidarScan    decoder   : raw bytes -> revolutions of nodes (pure function, no hardware)
+#   Start-RplidarScan / Stop-RplidarScan   hardware: motor on + scan command / stop + motor off + close port
+#   Invoke-RplidarCapture      hardware  : record raw bytes for N seconds (uses the two above, always stops the motor)
+#   New-RplidarStreamDecoder   decoder   : incremental decoder for live data (chunk-size independent)
+#   ConvertFrom-RplidarScan    decoder   : whole byte array -> revolutions of nodes (wraps the stream decoder)
 #   Select-RplidarSweep        selection : pick one representative revolution
 #   Merge-RplidarRevolutions   fusion    : median-merge many revolutions of a still scene into one denser sweep
 #   Find-RplidarNearestObject  measuring : nearest object per revolution (angle, distance) for accuracy tests
@@ -28,6 +30,49 @@ Set-StrictMode -Version Latest
 $script:ScanDescriptor = [byte[]](0xA5, 0x5A, 0x05, 0x00, 0x00, 0x40, 0x81)
 $script:Culture = [System.Globalization.CultureInfo]::InvariantCulture
 
+function Start-RplidarScan {
+    <#
+    .SYNOPSIS  Open the port, spin the motor up and start a standard scan. Returns the open SerialPort.
+    .DESCRIPTION
+      The caller owns the port and MUST pass it to Stop-RplidarScan (use try/finally) so the motor is switched off.
+      Data begins to arrive about 1 s after this returns.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Port = 'COM3',
+        [ValidateRange(0, 10)][int]$SpinUpSeconds = 3
+    )
+    $sp = New-Object System.IO.Ports.SerialPort $Port, 115200, 'None', 8, 'One'
+    $sp.ReadBufferSize = 262144          # PowerShell is slow; a big buffer prevents overflow while we loop
+    $sp.Open()
+    try {
+        $sp.DtrEnable = $false           # A1 adapter: DTR cleared = motor ON
+        $sp.Write([byte[]](0xA5, 0x25), 0, 2)   # STOP, in case a previous scan is still streaming
+        Start-Sleep -Milliseconds 100
+        Start-Sleep -Seconds $SpinUpSeconds
+        $sp.DiscardInBuffer()
+        $sp.Write([byte[]](0xA5, 0x20), 0, 2)   # SCAN
+    }
+    catch { Stop-RplidarScan -Port $sp; throw }
+    $sp
+}
+
+function Stop-RplidarScan {
+    <#
+    .SYNOPSIS  Stop the scan, switch the motor off and close the port. Safe to call on a closed port.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.IO.Ports.SerialPort]$Port)
+    try {
+        if ($Port.IsOpen) {
+            try { $Port.Write([byte[]](0xA5, 0x25), 0, 2) } catch { Write-Warning "Could not send STOP: $($_.Exception.Message)" }
+            $Port.DtrEnable = $true      # DTR set = motor OFF
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    finally { $Port.Close(); $Port.Dispose() }
+}
+
 function Invoke-RplidarCapture {
     <#
     .SYNOPSIS  Record raw scan bytes from the lidar. The motor is stopped even if capture fails.
@@ -39,18 +84,10 @@ function Invoke-RplidarCapture {
         [ValidateRange(1, 30)][int]$Seconds = 4,
         [ValidateRange(0, 10)][int]$SpinUpSeconds = 3
     )
-    $sp = New-Object System.IO.Ports.SerialPort $Port, 115200, 'None', 8, 'One'
-    $sp.ReadBufferSize = 262144          # PowerShell is slow; a big buffer prevents overflow while we loop
     $ms = New-Object System.IO.MemoryStream
     $firstData = $null
-    $sp.Open()
+    $sp = Start-RplidarScan -Port $Port -SpinUpSeconds $SpinUpSeconds
     try {
-        $sp.DtrEnable = $false           # A1 adapter: DTR cleared = motor ON
-        $sp.Write([byte[]](0xA5, 0x25), 0, 2)   # STOP, in case a previous scan is still streaming
-        Start-Sleep -Milliseconds 100
-        Start-Sleep -Seconds $SpinUpSeconds
-        $sp.DiscardInBuffer()
-        $sp.Write([byte[]](0xA5, 0x20), 0, 2)   # SCAN
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $chunk = New-Object byte[] 8192
         while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
@@ -62,17 +99,99 @@ function Invoke-RplidarCapture {
         }
         $elapsed = $sw.Elapsed.TotalSeconds
     }
-    finally {
-        try { $sp.Write([byte[]](0xA5, 0x25), 0, 2) } catch { Write-Warning "Could not send STOP: $($_.Exception.Message)" }
-        $sp.DtrEnable = $true            # DTR set = motor OFF
-        Start-Sleep -Milliseconds 200
-        $sp.Close()
-    }
+    finally { Stop-RplidarScan -Port $sp }
     [pscustomobject]@{
         Bytes            = $ms.ToArray()
         FirstDataSeconds = $firstData
         ElapsedSeconds   = $elapsed
     }
+}
+
+function New-RplidarStreamDecoder {
+    <#
+    .SYNOPSIS  Incremental decoder: feed raw bytes in chunks of any size, collect completed revolutions as they finish.
+    .DESCRIPTION
+      Returns an object with three scriptblocks (call with &):
+        Feed  <byte[]>   add bytes
+        Take             returns the array of revolutions completed since the last Take (node arrays, as ConvertFrom-RplidarScan)
+        Stats            decoder counters
+      Node validation and re-alignment are described at ConvertFrom-RplidarScan. The result does not depend on how
+      the bytes are chunked (tests.ps1 checks this with 1-byte, odd and random chunk sizes).
+      Bytes before the response descriptor are dropped and counted in PreDescriptorBytes.
+    #>
+    [CmdletBinding()]
+    param()
+    $st = [pscustomobject]@{
+        Buf = New-Object 'System.Collections.Generic.List[byte]'
+        Found = $false; Cur = $null
+        Done = New-Object 'System.Collections.Generic.List[object]'
+        Fed = 0; Pre = 0; Skipped = 0; Nodes = 0; Before = 0; Revs = 0
+    }
+    $desc = $script:ScanDescriptor
+
+    $feed = {
+        param([byte[]]$Bytes)
+        $st.Fed += $Bytes.Length
+        $b = $st.Buf
+        $b.AddRange($Bytes)
+        $i = 0
+        if (-not $st.Found) {
+            $hit = -1
+            for ($p = 0; $p -le $b.Count - $desc.Length; $p++) {
+                $m = $true
+                for ($k = 0; $k -lt $desc.Length; $k++) { if ($b[$p + $k] -ne $desc[$k]) { $m = $false; break } }
+                if ($m) { $hit = $p; break }
+            }
+            if ($hit -lt 0) {      # keep a possible partial descriptor at the end, drop the rest
+                $drop = $b.Count - [math]::Min($desc.Length - 1, $b.Count)
+                if ($drop -gt 0) { $b.RemoveRange(0, $drop); $st.Pre += $drop }
+                return
+            }
+            $st.Pre += $hit; $st.Found = $true; $i = $hit + $desc.Length
+        }
+        while ($i + 5 -le $b.Count) {
+            $b0 = [int]$b[$i]; $b1 = [int]$b[$i + 1]; $b2 = [int]$b[$i + 2]
+            $s = $b0 -band 1
+            $notS = ($b0 -shr 1) -band 1
+            $angleQ6 = ($b1 -shr 1) -bor ($b2 -shl 7)      # [int] casts matter: byte shifts would truncate
+            if ($s -eq $notS -or ($b1 -band 1) -ne 1 -or $angleQ6 -ge 23040) { $st.Skipped++; $i++; continue }
+            if ($s -eq 1) {
+                if ($null -ne $st.Cur -and $st.Cur.Count -gt 0) { $st.Done.Add($st.Cur.ToArray()); $st.Revs++ }
+                $st.Cur = New-Object 'System.Collections.Generic.List[object]'
+            }
+            $distQ2 = [int]$b[$i + 3] -bor ([int]$b[$i + 4] -shl 8)
+            $st.Nodes++
+            if ($null -eq $st.Cur) { $st.Before++ }
+            else {
+                $st.Cur.Add([pscustomobject]@{
+                    Angle    = $angleQ6 / 64.0
+                    Distance = $distQ2 / 4.0
+                    Quality  = $b0 -shr 2
+                    Valid    = ($distQ2 -gt 0)
+                })
+            }
+            $i += 5
+        }
+        if ($i -gt 0) { $b.RemoveRange(0, $i) }
+    }.GetNewClosure()
+
+    $take = { $a = $st.Done.ToArray(); $st.Done.Clear(); , $a }.GetNewClosure()
+
+    $stats = {
+        [pscustomobject]@{
+            DescriptorFound       = $st.Found
+            TotalBytes            = $st.Fed
+            PreDescriptorBytes    = $st.Pre
+            Nodes                 = $st.Nodes
+            SkippedBytes          = $st.Skipped
+            LeftoverBytes         = $(if ($st.Found) { $st.Buf.Count } else { 0 })
+            NodesBeforeFirstStart = $st.Before
+            NodesInPartialLastRev = $(if ($null -ne $st.Cur) { $st.Cur.Count } else { 0 })
+            CompleteRevolutions   = $st.Revs
+        }
+    }.GetNewClosure()
+
+    [pscustomobject]@{ Feed = $feed; Take = $take; Stats = $stats }
 }
 
 function ConvertFrom-RplidarScan {
@@ -89,58 +208,12 @@ function ConvertFrom-RplidarScan {
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][byte[]]$Bytes)
-
-    $d = $script:ScanDescriptor
-    $start = -1
-    for ($i = 0; $i -le $Bytes.Length - $d.Length; $i++) {
-        $hit = $true
-        for ($k = 0; $k -lt $d.Length; $k++) { if ($Bytes[$i + $k] -ne $d[$k]) { $hit = $false; break } }
-        if ($hit) { $start = $i; break }
-    }
-    if ($start -lt 0) { throw 'Scan response descriptor (A5 5A 05 00 00 40 81) not found in data.' }
-
-    $revs = New-Object 'System.Collections.Generic.List[object]'
-    $cur = $null
-    $skipped = 0; $nodesTotal = 0; $nodesBeforeFirstStart = 0
-    $i = $start + $d.Length
-    while ($i + 5 -le $Bytes.Length) {
-        $b0 = [int]$Bytes[$i]; $b1 = [int]$Bytes[$i + 1]; $b2 = [int]$Bytes[$i + 2]
-        $s = $b0 -band 1
-        $notS = ($b0 -shr 1) -band 1
-        $angleQ6 = ($b1 -shr 1) -bor ($b2 -shl 7)      # [int] casts matter: byte shifts would truncate
-        if ($s -eq $notS -or ($b1 -band 1) -ne 1 -or $angleQ6 -ge 23040) { $skipped++; $i++; continue }
-
-        if ($s -eq 1) {
-            if ($null -ne $cur -and $cur.Count -gt 0) { $revs.Add($cur.ToArray()) }
-            $cur = New-Object 'System.Collections.Generic.List[object]'
-        }
-        $distQ2 = [int]$Bytes[$i + 3] -bor ([int]$Bytes[$i + 4] -shl 8)
-        $nodesTotal++
-        if ($null -eq $cur) { $nodesBeforeFirstStart++ }
-        else {
-            $cur.Add([pscustomobject]@{
-                Angle    = $angleQ6 / 64.0
-                Distance = $distQ2 / 4.0
-                Quality  = $b0 -shr 2
-                Valid    = ($distQ2 -gt 0)
-            })
-        }
-        $i += 5
-    }
-    $trailing = if ($null -ne $cur) { $cur.Count } else { 0 }   # nodes of the unfinished last revolution
-
-    [pscustomobject]@{
-        Revolutions = $revs.ToArray()
-        Stats       = [pscustomobject]@{
-            TotalBytes             = $Bytes.Length
-            Nodes                  = $nodesTotal
-            SkippedBytes           = $skipped
-            LeftoverBytes          = $Bytes.Length - $i
-            NodesBeforeFirstStart  = $nodesBeforeFirstStart
-            NodesInPartialLastRev  = $trailing
-            CompleteRevolutions    = $revs.Count
-        }
-    }
+    $dec = New-RplidarStreamDecoder
+    & $dec.Feed $Bytes
+    $stats = & $dec.Stats
+    if (-not $stats.DescriptorFound) { throw 'Scan response descriptor (A5 5A 05 00 00 40 81) not found in data.' }
+    $revs = & $dec.Take
+    [pscustomobject]@{ Revolutions = $revs; Stats = $stats }
 }
 
 function Select-RplidarSweep {
@@ -399,4 +472,4 @@ function Get-RplidarInfo {
     finally { $sp.Close() }
 }
 
-Export-ModuleMember -Function Invoke-RplidarCapture, ConvertFrom-RplidarScan, Select-RplidarSweep, Merge-RplidarRevolutions, Find-RplidarNearestObject, Get-RplidarAudit, Export-RplidarCsv, Get-RplidarInfo
+Export-ModuleMember -Function Start-RplidarScan, Stop-RplidarScan, Invoke-RplidarCapture, New-RplidarStreamDecoder, ConvertFrom-RplidarScan, Select-RplidarSweep, Merge-RplidarRevolutions, Find-RplidarNearestObject, Get-RplidarAudit, Export-RplidarCsv, Get-RplidarInfo

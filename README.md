@@ -13,7 +13,7 @@ Built on a slow laptop (2-core i3, 8 GB), so the code is deliberately light.
 | 1. Identify the device, install the driver, talk to it | done |
 | 2. Capture + decode + CSV + top-down view | done, validated (see below) |
 | 2b. Fuse revolutions (`scan.ps1 -Fuse`) | done, tested |
-| 3. Live view (continuous redraw) | planned |
+| 3. Live view (`live.ps1`) | done, tested on the sensor |
 | 4. Mapping / SLAM (move the sensor, build a floor plan) | planned |
 | Accuracy test against a tape measure (`accuracy.ps1`) | tooling done, **measurements pending** (needed before trusting absolute distances) |
 
@@ -40,6 +40,8 @@ powershell -ExecutionPolicy Bypass -File scan.ps1                 # one sweep ->
 powershell -ExecutionPolicy Bypass -File make_view.ps1 -Open      # data\scan.csv -> data\view.html
 powershell -ExecutionPolicy Bypass -File audit.ps1                # 8 s capture + integrity/repeatability report
 powershell -ExecutionPolicy Bypass -File audit.ps1 -RawPath data\raw.bin   # re-analyse a saved capture offline
+powershell -ExecutionPolicy Bypass -File live.ps1                 # live view at http://localhost:8765/ (Ctrl+C to stop)
+powershell -ExecutionPolicy Bypass -File live.ps1 -ReplayRaw data\raw.bin   # same, replaying a recording (no motor)
 powershell -ExecutionPolicy Bypass -File tests.ps1                # decoder tests, no hardware needed
 ```
 
@@ -68,7 +70,8 @@ Get-RplidarInfo -Port COM3                               # read-only: model, fir
 | `accuracy.ps1` | Tape-measure test: measured vs expected distance and angle, logged to `data\accuracy_log.csv` |
 | `make_view.ps1` | CSV to a self-contained HTML top-down view |
 | `audit.ps1` | Integrity and repeatability report with PASS/FAIL checks |
-| `tests.ps1` | 1,470 hardware-free checks: decoder, CSV writer, fusion, nearest-object finder |
+| `live.ps1` | Live top-down view: localhost-only web server + canvas page, auto-stop timers, `-ReplayRaw` test mode |
+| `tests.ps1` | 1,528 hardware-free checks: decoder (incl. chunk-size independence), CSV writer, fusion, nearest-object finder |
 
 ## How it works
 
@@ -90,7 +93,7 @@ PowerShell and overflows the serial buffer.
 
 ## Validation
 
-Hardware-free (`tests.ps1`, 1,470 checks): exact round trip of angle, distance and quality for every node of
+Hardware-free (`tests.ps1`, 1,528 checks): exact round trip of angle, distance and quality for every node of
 synthetic revolutions (including values above 1000 mm and zero-distance nodes), partial-revolution handling,
 junk before the descriptor, junk injected mid-stream (exactly the injected bytes are reported skipped, no real node
 lost), angle limits (359.984 accepted, 360 rejected), CSV correctness under a comma-decimal locale (de-DE).
@@ -109,6 +112,18 @@ Real sensor (`audit.ps1`, 50 revolutions, still room):
 
 Conclusion: the capture path is lossless. Missing dots are the sensor reporting "no echo", not data loss.
 
+## Live view
+
+`live.ps1` decodes the stream as it arrives (`New-RplidarStreamDecoder`, whose result does not depend on how the
+bytes are chunked) and serves the newest revolution to a canvas page that redraws only when new data arrives, about
+7 times a second, with the last 4 revolutions fading out behind it.
+
+- Binds to **localhost only**; requests with a foreign `Host` header are rejected.
+- The motor never runs forever: it stops after `-MaxMinutes` (default 10) and after `-IdleSeconds` (default 120)
+  without a browser request. Ctrl+C also stops it. The port and motor are released in a `finally` block.
+- `-ReplayRaw data\raw.bin` plays a recording at real speed through the same pipeline, for testing without the motor.
+- Measured on the 2-core i3 laptop: about 5 % of one core on the real sensor (about 2 % in replay), 0 skipped bytes,
+  7.5 revolutions/s.
 ## Known sensor behaviour (found the hard way)
 
 - **No-return nodes have unreliable angles.** A node with distance 0 can be reported several degrees ahead of its
@@ -141,8 +156,7 @@ Conclusion: the capture path is lossless. Missing dots are the sensor reporting 
 ## Roadmap
 
 1. Record the tape-measure results below (distance at several ranges, angle direction) and the pass band used.
-2. Live view with a light redraw loop.
-3. Scan matching / mapping while moving the sensor.
+2. Scan matching / mapping while moving the sensor.
 
 ## Accuracy measurements
 
