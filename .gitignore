@@ -1,0 +1,5 @@
+# scans are a map of the room: never publish them
+data/
+*.csv
+*.bin
+*.html
